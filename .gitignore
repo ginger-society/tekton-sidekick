@@ -1,0 +1,6 @@
+.env
+target
+src/models/schema.rs
+.ginger.tmp
+IAMService_client
+.DS_Store

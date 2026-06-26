@@ -1,0 +1,20 @@
+[debug]
+# You should generate your own by "openssl rand -base64 32"
+address = "0.0.0.0"
+port = 8089
+secret_key = "Yuvzw+jJ4yzKHi/JwHFl1y4X6Tjn/WrskHOWrlvt/L0="
+
+[release]
+address = "0.0.0.0"
+keep_alive = 5
+limits = {forms = 32768}
+log_level = "critical"
+port = 8080
+read_timeout = 5
+secret_key = "wsN27BdC/l2OgjxwDmaxOGzSosNt/r1SiZViX0dUX4c="
+write_timeout = 5
+
+
+[global]
+address = "0.0.0.0"
+port = 8080
