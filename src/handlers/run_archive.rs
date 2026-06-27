@@ -36,15 +36,16 @@ async fn pg_conn(pool: &Pool) -> Result<deadpool_postgres::Client, ArchiveError>
     pool.get().await.map_err(|e| ArchiveError::Db(e.to_string()))
 }
 
+// Updated fetch_pg_records — also return the run's time window
 async fn fetch_pg_records(
     pool: &Pool,
     run_name: &str,
-) -> Result<(Value, Vec<Value>), ArchiveError> {
+) -> Result<(Value, Vec<Value>, u128, u128), ArchiveError> {
     let client = pg_conn(pool).await?;
 
     let pr_row = client
         .query_opt(
-            "SELECT name, data::text AS data FROM records \
+            "SELECT name, data::text AS data, created_time, updated_time FROM records \
              WHERE type = 'tekton.dev/v1.PipelineRun' \
                AND data->'metadata'->>'name' = $1 \
              ORDER BY created_time DESC LIMIT 1",
@@ -57,6 +58,27 @@ async fn fetch_pg_records(
     let pr_data_text: String = pr_row.get("data");
     let pr_data: Value = serde_json::from_str(&pr_data_text)
         .map_err(|e| ArchiveError::Db(format!("bad JSON in records.data: {e}")))?;
+
+    // Extract the run's actual time window from Postgres so Loki doesn't
+    // have to scan 31 days. Add a 5-minute buffer on each side to absorb
+    // clock skew between the cluster and Loki's ingestion timestamp.
+    let created_time: std::time::SystemTime = pr_row.get("created_time");
+    let updated_time: std::time::SystemTime = pr_row.get("updated_time");
+
+    let buffer = std::time::Duration::from_secs(300); // 5 min each side
+    let start_ns = created_time
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .saturating_sub(buffer)
+        .as_nanos();
+    let end_ns = updated_time
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .checked_add(buffer)
+        .unwrap_or_else(|| updated_time
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default())
+        .as_nanos();
 
     let tr_rows = client
         .query(
@@ -77,7 +99,7 @@ async fn fetch_pg_records(
         })
         .collect();
 
-    Ok((pr_data, taskruns))
+    Ok((pr_data, taskruns, start_ns, end_ns))
 }
 
 fn cond_status_reason(obj: &Value) -> (Option<String>, Option<String>) {
@@ -144,7 +166,7 @@ fn steps_from_archived_taskrun(tr_data: &Value) -> Vec<StepMeta> {
 }
 
 pub async fn fetch_archived_meta(pool: &Pool, run_name: &str) -> Result<RunMeta, ArchiveError> {
-    let (pr_data, tr_data_list) = fetch_pg_records(pool, run_name).await?;
+    let (pr_data, tr_data_list, _, _) = fetch_pg_records(pool, run_name).await?;
 
     let pipeline_name = pr_data
         .get("spec")
@@ -260,19 +282,16 @@ struct LokiStream {
     values: Vec<(String, String)>,
 }
 
-async fn fetch_archived_logs_raw(run_name: &str) -> Result<Vec<LogLine>, ArchiveError> {
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let start_ns = now_ns.saturating_sub(
-        Duration::from_secs((LOKI_LOOKBACK_DAYS * 86_400) as u64).as_nanos(),
-    );
-
+// Updated fetch_archived_logs_raw — accepts explicit time window
+async fn fetch_archived_logs_raw(
+    run_name: &str,
+    start_ns: u128,
+    end_ns: u128,
+) -> Result<Vec<LogLine>, ArchiveError> {
     let query = format!(r#"{{pipelinerun="{run_name}"}}"#);
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| ArchiveError::Loki(e.to_string()))?;
 
@@ -282,7 +301,7 @@ async fn fetch_archived_logs_raw(run_name: &str) -> Result<Vec<LogLine>, Archive
             ("query", query.as_str()),
             ("limit", "5000"),
             ("start", start_ns.to_string().as_str()),
-            ("end", now_ns.to_string().as_str()),
+            ("end", end_ns.to_string().as_str()),
             ("direction", "forward"),
         ])
         .send()
@@ -345,21 +364,18 @@ async fn fetch_archived_logs_raw(run_name: &str) -> Result<Vec<LogLine>, Archive
 
 /// Fetch logs + remap Loki's task-ref-based `task` label back to the
 /// pipeline task name, running the PG and Loki queries concurrently.
+// Updated fetch_archived_logs_for_run — threads the time window through
 pub async fn fetch_archived_logs_for_run(
     pool: &Pool,
     run_name: &str,
 ) -> Result<Vec<LogLine>, ArchiveError> {
-    // Fire PG (for the task-ref -> pipeline-task-name mapping) and Loki
-    // (for the actual log lines) concurrently — they're independent.
-    let (pg_result, loki_result) = tokio::join!(
-        fetch_pg_records(pool, run_name),
-        fetch_archived_logs_raw(run_name),
-    );
+    // PG first (fast) to get the time window, then fire Loki with it.
+    // We can't fully parallelize here since Loki needs the window from PG,
+    // but PG is a pooled in-cluster call so it's cheap (< 50ms typically).
+    let (_, tr_data_list, start_ns, end_ns) = fetch_pg_records(pool, run_name).await?;
 
-    let (_, tr_data_list) = pg_result?;
-    let mut lines = loki_result?;
+    let mut lines = fetch_archived_logs_raw(run_name, start_ns, end_ns).await?;
 
-    // Build: task_ref_name -> pipeline_task_name
     let task_ref_to_pipeline_task: std::collections::HashMap<String, String> = tr_data_list
         .iter()
         .filter_map(|tr| {
