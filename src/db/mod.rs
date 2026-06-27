@@ -9,6 +9,7 @@ pub mod k8s_tekton;
 pub mod k8s_client;
 
 pub mod redis;
+pub mod pg;
 
 pub fn connect_mongo(mongo_uri: String, mongo_db_name: String) -> AdHoc {
     AdHoc::on_ignite("Connecting to MongoDB", |rocket| async {

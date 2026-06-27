@@ -1,46 +1,12 @@
 // src/handlers/run_archive.rs
 
-//! Archive fallback — reconstructs run metadata and logs from
-//! tekton-results Postgres + Loki, for PipelineRuns no longer in the
-//! cluster. This is the Rust equivalent of query-run.sh, but structured
-//! so the SSE handler can stream it the same way as a live run instead of
-//! printing it.
-//!
-//! NOTE: this hits Postgres and Loki directly over the network (same as
-//! query-run.sh execs into the postgres/loki pods via kubectl). Since this
-//! service runs in-cluster, we connect straight to the service DNS names
-//! instead of shelling out through kubectl exec — that's the "as native
-//! as possible" approach for a long-running service rather than a
-//! one-shot script.
-
 use std::time::Duration;
 
+use deadpool_postgres::Pool;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio_postgres::NoTls;
 
 use crate::models::run_stream::{LogLine, RunMeta, RunSource, RunStatus, StepMeta, TaskMeta};
-
-// in run_archive.rs, replace the const block with:
-
-fn pg_host() -> String {
-    std::env::var("TEKTON_RESULTS_PG_HOST")
-        .unwrap_or_else(|_| "tekton-results-postgres.tekton-pipelines.svc.cluster.local".into())
-}
-fn pg_user() -> String {
-    std::env::var("TEKTON_RESULTS_PG_USER")
-        .unwrap_or_else(|_| "tekton".into())
-}
-fn pg_db() -> String {
-    std::env::var("TEKTON_RESULTS_PG_DB")
-        .unwrap_or_else(|_| "tekton-results".into())
-}
-fn pg_port() -> u16 {
-    std::env::var("TEKTON_RESULTS_PG_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(5432)
-}
 
 const LOKI_BASE_URL: &str = "http://loki.logging.svc.cluster.local:3100";
 const LOKI_LOOKBACK_DAYS: i64 = 31;
@@ -62,53 +28,19 @@ impl std::fmt::Display for ArchiveError {
     }
 }
 
-// ── Postgres ───────────────────────────────────────────────────────────
-//
-// tekton-results stores each PipelineRun/TaskRun as a JSON blob under
-// `records.data` — the same table query-run.sh's `pg()` helper hits via
-// psql. We use `tokio-postgres` directly: a true async client, so the
-// SSE handler's polling loop never blocks the tokio runtime waiting on a
-// DB round trip (unlike diesel's sync `PgConnection`, which would need
-// `spawn_blocking` for every call). Since this is read-only, ad hoc JSON
-// querying against a database this service has no schema/migrations
-// for, a raw async client is a better fit than wiring up diesel for it.
-//
-// Add to Cargo.toml:
-//   tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+// ── Postgres ───────────────────────────────────────────────────────────────
 
-async fn pg_connect() -> Result<tokio_postgres::Client, ArchiveError> {
-    let pg_pass = std::env::var("TEKTON_RESULTS_PG_PASSWORD")
-        .map_err(|_| ArchiveError::Db("TEKTON_RESULTS_PG_PASSWORD not set".into()))?;
-
-    let conn_str = format!(
-        "host={} port={} user={} password={} dbname={} connect_timeout=5",
-        pg_host(), pg_port(), pg_user(), pg_pass, pg_db()
-    );
-
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .map_err(|e| ArchiveError::Db(e.to_string()))?;
-
-    // Drive the connection in the background; log if it dies mid-query.
-    // This is a short-lived connection per request — fine at the call
-    // volume an archive-fallback path sees. If this becomes hot, swap in
-    // a pool (bb8 + bb8-postgres / deadpool-postgres) without changing
-    // any call site below.
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("tekton-results postgres connection error: {e}");
-        }
-    });
-
-    Ok(client)
+/// Borrow a connection from the pool — no TCP handshake, no auth round
+/// trip; the pool keeps connections warm between requests.
+async fn pg_conn(pool: &Pool) -> Result<deadpool_postgres::Client, ArchiveError> {
+    pool.get().await.map_err(|e| ArchiveError::Db(e.to_string()))
 }
 
-/// Look up the stored PipelineRun + TaskRun records for `run_name`.
-/// Returns `Err(ArchiveError::NotFound)` if there's no PipelineRun record
-/// at all — the caller's signal that this run name doesn't exist
-/// anywhere, live or archived.
-async fn fetch_pg_records(run_name: &str) -> Result<(Value, Vec<Value>), ArchiveError> {
-    let client = pg_connect().await?;
+async fn fetch_pg_records(
+    pool: &Pool,
+    run_name: &str,
+) -> Result<(Value, Vec<Value>), ArchiveError> {
+    let client = pg_conn(pool).await?;
 
     let pr_row = client
         .query_opt(
@@ -196,8 +128,6 @@ fn steps_from_archived_taskrun(tr_data: &Value) -> Vec<StepMeta> {
                         };
                         (status, reason)
                     } else {
-                        // Archived runs are always terminal by definition —
-                        // an unterminated step here means it never ran.
                         (RunStatus::Unknown, None)
                     };
 
@@ -213,10 +143,8 @@ fn steps_from_archived_taskrun(tr_data: &Value) -> Vec<StepMeta> {
         .unwrap_or_default()
 }
 
-/// Build a complete `RunMeta` for an archived run from Postgres records
-/// alone (no logs yet — those stream separately from Loki).
-pub async fn fetch_archived_meta(run_name: &str) -> Result<RunMeta, ArchiveError> {
-    let (pr_data, tr_data_list) = fetch_pg_records(run_name).await?;
+pub async fn fetch_archived_meta(pool: &Pool, run_name: &str) -> Result<RunMeta, ArchiveError> {
+    let (pr_data, tr_data_list) = fetch_pg_records(pool, run_name).await?;
 
     let pipeline_name = pr_data
         .get("spec")
@@ -228,12 +156,6 @@ pub async fn fetch_archived_meta(run_name: &str) -> Result<RunMeta, ArchiveError
     let (pr_status, pr_reason) = cond_status_reason(&pr_data);
     let run_status = RunStatus::from_condition(pr_status.as_deref(), true);
 
-    // `runAfter` lives on the *PipelineRun's* snapshotted pipeline spec
-    // (status.pipelineSpec.tasks[].runAfter), not on the TaskRun -- same
-    // place the live path (`run_discovery::declared_task_order`) reads it
-    // from. tekton-results preserves this whole blob verbatim, so it's
-    // available identically for archived runs; build a quick name ->
-    // depends_on lookup once, up front, rather than re-scanning per task.
     let depends_on_by_task: std::collections::HashMap<String, Vec<String>> = pr_data
         .get("status")
         .and_then(|s| s.get("pipelineSpec"))
@@ -293,7 +215,10 @@ pub async fn fetch_archived_meta(run_name: &str) -> Result<RunMeta, ArchiveError
             .map(String::from)
             .or_else(|| Some(format!("{taskrun_name}-pod")));
 
-        let depends_on = depends_on_by_task.get(&pipeline_task_name).cloned().unwrap_or_default();
+        let depends_on = depends_on_by_task
+            .get(&pipeline_task_name)
+            .cloned()
+            .unwrap_or_default();
 
         tasks.push(TaskMeta {
             name: pipeline_task_name,
@@ -317,7 +242,7 @@ pub async fn fetch_archived_meta(run_name: &str) -> Result<RunMeta, ArchiveError
     })
 }
 
-// ── Loki ───────────────────────────────────────────────────────────────
+// ── Loki ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct LokiResponse {
@@ -335,11 +260,7 @@ struct LokiStream {
     values: Vec<(String, String)>,
 }
 
-/// Pull every log line Loki has for `run_name`, labeled and time-sorted,
-/// as flat `LogLine`s the SSE handler can stream task/step at a time —
-/// equivalent to `loki_query()` + `parse_logs()` in query-run.sh, minus
-/// the pretty-printing (the FE owns presentation here).
-pub async fn fetch_archived_logs(run_name: &str) -> Result<Vec<LogLine>, ArchiveError> {
+async fn fetch_archived_logs_raw(run_name: &str) -> Result<Vec<LogLine>, ArchiveError> {
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -381,8 +302,6 @@ pub async fn fetch_archived_logs(run_name: &str) -> Result<Vec<LogLine>, Archive
         .map_err(|e| ArchiveError::Loki(format!("bad JSON from loki: {e}")))?;
 
     let mut streams = parsed.data.result;
-    // Sort streams by first entry timestamp, same as query-run.sh's
-    // `results.sort(key=lambda s: s['values'][0][0] ...)`.
     streams.sort_by(|a, b| {
         let a_ts = a.values.first().map(|(t, _)| t.as_str()).unwrap_or("0");
         let b_ts = b.values.first().map(|(t, _)| t.as_str()).unwrap_or("0");
@@ -391,9 +310,6 @@ pub async fn fetch_archived_logs(run_name: &str) -> Result<Vec<LogLine>, Archive
 
     let mut lines = Vec::new();
     for stream in streams {
-        // Loki labels carry which task/step this stream belongs to — the
-        // pipeline's pod labels (set by Tekton) are forwarded into Loki's
-        // label set by the cluster's log shipper.
         let task = stream
             .stream
             .get("task")
@@ -406,8 +322,6 @@ pub async fn fetch_archived_logs(run_name: &str) -> Result<Vec<LogLine>, Archive
             .unwrap_or_else(|| "unknown".to_string());
 
         for (ts_ns, raw_line) in stream.values {
-            // Strip carriage-return progress spam, same as query-run.sh:
-            // `line.split('\r')[-1].strip()`.
             let line = raw_line
                 .rsplit('\r')
                 .next()
@@ -429,16 +343,21 @@ pub async fn fetch_archived_logs(run_name: &str) -> Result<Vec<LogLine>, Archive
     Ok(lines)
 }
 
+/// Fetch logs + remap Loki's task-ref-based `task` label back to the
+/// pipeline task name, running the PG and Loki queries concurrently.
+pub async fn fetch_archived_logs_for_run(
+    pool: &Pool,
+    run_name: &str,
+) -> Result<Vec<LogLine>, ArchiveError> {
+    // Fire PG (for the task-ref -> pipeline-task-name mapping) and Loki
+    // (for the actual log lines) concurrently — they're independent.
+    let (pg_result, loki_result) = tokio::join!(
+        fetch_pg_records(pool, run_name),
+        fetch_archived_logs_raw(run_name),
+    );
 
-// run_archive.rs
-
-/// Same as `fetch_archived_logs` but remaps Loki's `task` label (which
-/// your cluster's log shipper sets from the pod's `app` or `tekton.dev/task`
-/// label — the taskRef name) back to the pipelineTaskName so it matches
-/// what the `meta` event uses.
-pub async fn fetch_archived_logs_for_run(run_name: &str) -> Result<Vec<LogLine>, ArchiveError> {
-    // Fetch the PG records to build the taskRef -> pipelineTaskName mapping.
-    let (_, tr_data_list) = fetch_pg_records(run_name).await?;
+    let (_, tr_data_list) = pg_result?;
+    let mut lines = loki_result?;
 
     // Build: task_ref_name -> pipeline_task_name
     let task_ref_to_pipeline_task: std::collections::HashMap<String, String> = tr_data_list
@@ -450,27 +369,20 @@ pub async fn fetch_archived_logs_for_run(run_name: &str) -> Result<Vec<LogLine>,
                 .and_then(|l| l.get("tekton.dev/pipelineTask"))
                 .and_then(|n| n.as_str())
                 .map(String::from)?;
-
-            // The task ref name is what Loki's `task` label will contain.
             let task_ref_name = tr
                 .get("spec")
                 .and_then(|s| s.get("taskRef"))
                 .and_then(|r| r.get("name"))
                 .and_then(|n| n.as_str())
                 .map(String::from)?;
-
             Some((task_ref_name, pipeline_task_name))
         })
         .collect();
 
-    let mut lines = fetch_archived_logs(run_name).await?;
-
-    // Remap task names in place.
     for line in &mut lines {
         if let Some(mapped) = task_ref_to_pipeline_task.get(&line.task) {
             line.task = mapped.clone();
         }
-        // If no mapping found, leave as-is — better than dropping the line.
     }
 
     Ok(lines)

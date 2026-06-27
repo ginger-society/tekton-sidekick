@@ -66,6 +66,8 @@ tokio-util = { version = "0.7", features = ["compat"] }
 # SSE handler is also using (unlike diesel's sync PgConnection).
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 tracing = "0.1"
+deadpool-postgres = { version = "0.14" }
+
 
 [package.metadata]
 organization = "ginger-society"
