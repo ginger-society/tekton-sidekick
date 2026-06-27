@@ -21,10 +21,26 @@ use tokio_postgres::NoTls;
 
 use crate::models::run_stream::{LogLine, RunMeta, RunSource, RunStatus, StepMeta, TaskMeta};
 
-const PG_HOST: &str = "tekton-results-postgres.tekton-pipelines.svc.cluster.local";
-const PG_PORT: u16 = 5432;
-const PG_USER: &str = "tekton";
-const PG_DB: &str = "tekton-results";
+// in run_archive.rs, replace the const block with:
+
+fn pg_host() -> String {
+    std::env::var("TEKTON_RESULTS_PG_HOST")
+        .unwrap_or_else(|_| "tekton-results-postgres.tekton-pipelines.svc.cluster.local".into())
+}
+fn pg_user() -> String {
+    std::env::var("TEKTON_RESULTS_PG_USER")
+        .unwrap_or_else(|_| "tekton".into())
+}
+fn pg_db() -> String {
+    std::env::var("TEKTON_RESULTS_PG_DB")
+        .unwrap_or_else(|_| "tekton-results".into())
+}
+fn pg_port() -> u16 {
+    std::env::var("TEKTON_RESULTS_PG_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5432)
+}
 
 const LOKI_BASE_URL: &str = "http://loki.logging.svc.cluster.local:3100";
 const LOKI_LOOKBACK_DAYS: i64 = 31;
@@ -65,8 +81,8 @@ async fn pg_connect() -> Result<tokio_postgres::Client, ArchiveError> {
         .map_err(|_| ArchiveError::Db("TEKTON_RESULTS_PG_PASSWORD not set".into()))?;
 
     let conn_str = format!(
-        "host={PG_HOST} port={PG_PORT} user={PG_USER} password={pg_pass} dbname={PG_DB} \
-         connect_timeout=5"
+        "host={} port={} user={} password={} dbname={} connect_timeout=5",
+        pg_host(), pg_port(), pg_user(), pg_pass, pg_db()
     );
 
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
