@@ -22,7 +22,7 @@ mod models;
 mod routes;
 
 
-const SERVICE_PREFIX: &str = "tekton-sidekick";
+const SERVICE_PREFIX: &str = "sidekick";
 
 #[tokio::main]
 async fn main() {
