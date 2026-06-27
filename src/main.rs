@@ -49,7 +49,7 @@ async fn main() {
             }),
         )
         .mount(format!("/{}/metrics", SERVICE_PREFIX), prometheus)
-        .mount("/", routes![
+        .mount(format!("/{}/", SERVICE_PREFIX), routes![
             routes::stream_counter,           // SSE routes go here, outside openapi
             routes::run_stream::stream_pipeline_run,
         ]);
