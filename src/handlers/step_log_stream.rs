@@ -31,12 +31,12 @@ pub enum WaitResult {
 
 /// Block until `pod_name`'s `container` is running or terminated (i.e.
 /// logs are guaranteed to be readable), or until we give up.
-pub async fn wait_for_container_ready(pod_name: &str, container: &str) -> WaitResult {
+pub async fn wait_for_container_ready(namespace: &str,pod_name: &str, container: &str) -> WaitResult {
     let mut attempt = 0u32;
 
     loop {
         let client = get_client().await;
-        let api: Api<Pod> = Api::default_namespaced(client);
+        let api: Api<Pod> = Api::namespaced(client, namespace);
 
         match api.get(pod_name).await {
             Ok(pod) => {
@@ -78,12 +78,13 @@ pub async fn wait_for_container_ready(pod_name: &str, container: &str) -> WaitRe
 /// errors are sent down the channel as a line rather than propagated, so
 /// one bad container doesn't take down the whole SSE response.
 pub async fn stream_step_logs(
+    namespace: &str,
     pod_name: &str,
     container: &str,
     line_tx: tokio::sync::mpsc::UnboundedSender<(Option<String>, String)>,
 ) {
     let client = get_client().await;
-    let api: Api<Pod> = Api::default_namespaced(client);
+    let api: Api<Pod> = Api::namespaced(client, namespace);
 
     let params = LogParams {
         follow: true,

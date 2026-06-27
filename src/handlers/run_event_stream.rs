@@ -15,39 +15,52 @@ use crate::models::run_stream::{
     TaskStatusUpdate,
 };
 
-const NAMESPACE: &str = "default";
 const TASKRUN_TERMINAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 const TASKRUN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Pool is passed in from the Rocket route handler via `&rocket::State<Pool>`.
 pub fn run_event_stream(
+    namespace: String,
     run_name: String,
     mut shutdown: Shutdown,
-    pool: Pool,   // ← cloned from State<Pool> before entering EventStream!
+    pool: Pool,
 ) -> EventStream![] {
     EventStream! {
         let start = std::time::Instant::now();
 
         // ── Step 1: discover — live first, archive on NotFound ──────────
-        let meta = match discover_live_run(NAMESPACE, &run_name).await {
+        let meta = match discover_live_run(&namespace, &run_name).await {
             Ok(meta) => meta,
             Err(DiscoverError::NotFound) => {
                 match fetch_archived_meta(&pool, &run_name).await {
-                    Ok(meta) => meta,
+                    Ok(meta) => {
+                        // Only treat as archived if actually terminal.
+                        // If tekton-results ingested it while still running,
+                        // don't fall into the archive path prematurely.
+                        if !meta.status.is_terminal() {
+                            yield Event::json(&StreamError {
+                                message: format!(
+                                    "PipelineRun '{run_name}' not found live in cluster \
+                                     and is not yet terminal in archive (status: {:?}). \
+                                     The run may be in a different namespace.",
+                                    meta.status
+                                ),
+                            }).event("error");
+                            return;
+                        }
+                        meta
+                    }
                     Err(ArchiveError::NotFound) => {
                         yield Event::json(&StreamError {
                             message: format!(
                                 "PipelineRun '{run_name}' was not found live or in the archive"
                             ),
-                        })
-                        .event("error");
+                        }).event("error");
                         return;
                     }
                     Err(e) => {
                         yield Event::json(&StreamError {
                             message: e.to_string(),
-                        })
-                        .event("error");
+                        }).event("error");
                         return;
                     }
                 }
@@ -55,8 +68,7 @@ pub fn run_event_stream(
             Err(DiscoverError::Kube(e)) => {
                 yield Event::json(&StreamError {
                     message: format!("error reading PipelineRun from cluster: {e}"),
-                })
-                .event("error");
+                }).event("error");
                 return;
             }
         };
@@ -67,8 +79,6 @@ pub fn run_event_stream(
 
         match source {
             RunSource::Archive => {
-                // Spawn log fetch in background so the meta event above is
-                // already flushed to the client while we're still querying.
                 let (log_tx, mut log_rx) = mpsc::unbounded_channel::<LogLine>();
                 let run_name_clone = run_name.clone();
                 let pool_clone = pool.clone();
@@ -84,13 +94,11 @@ pub fn run_event_stream(
                             });
                             for line in lines {
                                 if log_tx.send(line).is_err() {
-                                    break; // client disconnected
+                                    break;
                                 }
                             }
                         }
                         Err(e) => {
-                            // Log the error server-side; the done event
-                            // below still closes the stream cleanly.
                             eprintln!("archive log fetch error: {e}");
                         }
                     }
@@ -112,20 +120,19 @@ pub fn run_event_stream(
                     status: meta.status,
                     reason: meta.reason.clone(),
                     duration_seconds: None,
-                })
-                .event("done");
+                }).event("done");
             }
 
             RunSource::Tekton => {
-                // ── unchanged from original ──────────────────────────────
                 let (tx, mut rx) = mpsc::unbounded_channel::<SseItem>();
 
                 for task_snapshot in meta.tasks.clone() {
                     let tx = tx.clone();
                     let shutdown = shutdown.clone();
                     let run_name = run_name.clone();
+                    let namespace = namespace.clone();  // ← pass namespace to each worker
                     rocket::tokio::spawn(async move {
-                        run_task_worker(run_name, task_snapshot, tx, shutdown).await;
+                        run_task_worker(namespace, run_name, task_snapshot, tx, shutdown).await;
                     });
                 }
                 drop(tx);
@@ -181,7 +188,7 @@ pub fn run_event_stream(
                     (RunStatus::Failed, None)
                 } else {
                     let terminal = select! {
-                        r = wait_for_pipelinerun_terminal_status(&run_name) => Some(r),
+                        r = wait_for_pipelinerun_terminal_status(&namespace, &run_name) => Some(r),
                         _ = &mut shutdown => None,
                     };
                     let Some(result) = terminal else { return };
@@ -193,14 +200,13 @@ pub fn run_event_stream(
                     status: run_status,
                     reason: run_reason,
                     duration_seconds: Some(start.elapsed().as_secs() as i64),
-                })
-                .event("done");
+                }).event("done");
             }
         }
     }
 }
 
-// ── All helpers below are unchanged from original ──────────────────────────
+// ── Internal channel item ─────────────────────────────────────────────────
 
 enum SseItem {
     Log(LogLine),
@@ -210,7 +216,10 @@ enum SseItem {
     TaskDone,
 }
 
+// ── Per-task worker ───────────────────────────────────────────────────────
+
 async fn run_task_worker(
+    namespace: String,
     run_name: String,
     task_snapshot: TaskMeta,
     tx: mpsc::UnboundedSender<SseItem>,
@@ -218,7 +227,7 @@ async fn run_task_worker(
 ) {
     let task: TaskMeta = if task_snapshot.taskrun_name.is_empty() {
         let resolved = select! {
-            r = poll_for_task_start(&run_name, &task_snapshot.name) => Some(r),
+            r = poll_for_task_start(&namespace, &run_name, &task_snapshot.name) => Some(r),
             _ = &mut shutdown => None,
         };
         match resolved {
@@ -249,7 +258,7 @@ async fn run_task_worker(
     for step in &task.steps {
         if matches!(step.status, RunStatus::Pending) {
             let ready = select! {
-                r = wait_for_container_ready(&pod_name, &step.container) => Some(r),
+                r = wait_for_container_ready(&namespace, &pod_name, &step.container) => Some(r),
                 _ = &mut shutdown => None,
             };
             match ready {
@@ -273,8 +282,9 @@ async fn run_task_worker(
         let (log_tx, mut log_rx) = mpsc::unbounded_channel::<(Option<String>, String)>();
         let pod_name_cloned = pod_name.clone();
         let container_cloned = step.container.clone();
+        let namespace_cloned = namespace.clone();
         rocket::tokio::spawn(async move {
-            stream_step_logs(&pod_name_cloned, &container_cloned, log_tx).await;
+            stream_step_logs(&namespace_cloned, &pod_name_cloned, &container_cloned, log_tx).await;
         });
 
         loop {
@@ -284,15 +294,12 @@ async fn run_task_worker(
             };
             match next {
                 Some((timestamp, line)) => {
-                    if tx
-                        .send(SseItem::Log(LogLine {
-                            task: task.name.clone(),
-                            step: step.name.clone(),
-                            line,
-                            timestamp,
-                        }))
-                        .is_err()
-                    {
+                    if tx.send(SseItem::Log(LogLine {
+                        task: task.name.clone(),
+                        step: step.name.clone(),
+                        line,
+                        timestamp,
+                    })).is_err() {
                         return;
                     }
                 }
@@ -300,25 +307,22 @@ async fn run_task_worker(
             }
         }
 
-        let fresh_step = poll_fresh_step_status(&task.taskrun_name, &step.name)
+        let fresh_step = poll_fresh_step_status(&namespace, &task.taskrun_name, &step.name)
             .await
             .unwrap_or_else(|| step.clone());
 
-        if tx
-            .send(SseItem::StepStatus(StepStatusUpdate {
-                task: task.name.clone(),
-                step: step.name.clone(),
-                status: fresh_step.status,
-                reason: fresh_step.reason.clone(),
-            }))
-            .is_err()
-        {
+        if tx.send(SseItem::StepStatus(StepStatusUpdate {
+            task: task.name.clone(),
+            step: step.name.clone(),
+            status: fresh_step.status,
+            reason: fresh_step.reason.clone(),
+        })).is_err() {
             return;
         }
     }
 
     let terminal = select! {
-        r = wait_for_taskrun_terminal_status(&task.taskrun_name) => Some(r),
+        r = wait_for_taskrun_terminal_status(&namespace, &task.taskrun_name) => Some(r),
         _ = &mut shutdown => None,
     };
     let Some((final_status, final_reason)) = terminal else {
@@ -334,13 +338,19 @@ async fn run_task_worker(
     let _ = tx.send(SseItem::TaskDone);
 }
 
-async fn poll_for_task_start(run_name: &str, pipeline_task_name: &str) -> Option<TaskMeta> {
+// ── Polling helpers ───────────────────────────────────────────────────────
+
+async fn poll_for_task_start(
+    namespace: &str,
+    run_name: &str,
+    pipeline_task_name: &str,
+) -> Option<TaskMeta> {
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
     let start = std::time::Instant::now();
     loop {
-        match refresh_task(NAMESPACE, run_name, pipeline_task_name).await {
+        match refresh_task(namespace, run_name, pipeline_task_name).await {
             Ok(Some(task)) => {
                 if !task.steps.is_empty() || task.status.is_terminal() {
                     return Some(task);
@@ -357,6 +367,7 @@ async fn poll_for_task_start(run_name: &str, pipeline_task_name: &str) -> Option
 }
 
 async fn poll_fresh_step_status(
+    namespace: &str,
     taskrun_name: &str,
     step_name: &str,
 ) -> Option<crate::models::run_stream::StepMeta> {
@@ -364,7 +375,7 @@ async fn poll_fresh_step_status(
     const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
 
     for attempt in 0..MAX_ATTEMPTS {
-        if let Some(step) = refresh_step_status(NAMESPACE, taskrun_name, step_name).await {
+        if let Some(step) = refresh_step_status(namespace, taskrun_name, step_name).await {
             if step.status.is_terminal() {
                 return Some(step);
             }
@@ -377,10 +388,13 @@ async fn poll_fresh_step_status(
     None
 }
 
-async fn wait_for_taskrun_terminal_status(taskrun_name: &str) -> (RunStatus, Option<String>) {
+async fn wait_for_taskrun_terminal_status(
+    namespace: &str,
+    taskrun_name: &str,
+) -> (RunStatus, Option<String>) {
     let start = std::time::Instant::now();
     loop {
-        match crate::db::k8s_tekton::get_taskrun(NAMESPACE, taskrun_name).await {
+        match crate::db::k8s_tekton::get_taskrun(namespace, taskrun_name).await {
             Ok(Some(tr)) => {
                 let status = condition_status(&tr);
                 let reason = condition_reason(&tr);
@@ -403,11 +417,14 @@ async fn wait_for_taskrun_terminal_status(taskrun_name: &str) -> (RunStatus, Opt
     }
 }
 
-async fn wait_for_pipelinerun_terminal_status(run_name: &str) -> (RunStatus, Option<String>) {
+async fn wait_for_pipelinerun_terminal_status(
+    namespace: &str,
+    run_name: &str,
+) -> (RunStatus, Option<String>) {
     let start = std::time::Instant::now();
     let short_timeout = std::time::Duration::from_secs(30);
     loop {
-        match get_pipelinerun(NAMESPACE, run_name).await {
+        match get_pipelinerun(namespace, run_name).await {
             Ok(Some(pr)) => {
                 let status = condition_status(&pr);
                 let reason = condition_reason(&pr);

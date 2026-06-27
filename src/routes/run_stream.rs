@@ -7,13 +7,12 @@ use rocket::State;
 
 use crate::handlers::run_event_stream::run_event_stream;
 
-#[get("/runs/<run_name>/stream")]
+#[get("/runs/<namespace>/<run_name>/stream")]
 pub fn stream_pipeline_run(
+    namespace: String,
     run_name: String,
     shutdown: Shutdown,
     pg_pool: &State<Pool>,
 ) -> EventStream![] {
-    // Clone the pool (cheap — it's Arc-backed) before entering the
-    // EventStream! generator, which requires owned values.
-    run_event_stream(run_name, shutdown, pg_pool.inner().clone())
+    run_event_stream(namespace, run_name, shutdown, pg_pool.inner().clone())
 }
