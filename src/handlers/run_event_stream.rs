@@ -27,7 +27,7 @@ use rocket::tokio::sync::mpsc;
 use rocket::Shutdown;
 
 use crate::db::k8s_tekton::{condition_reason, condition_status, get_pipelinerun};
-use crate::handlers::run_archive::{fetch_archived_logs, fetch_archived_meta, ArchiveError};
+use crate::handlers::run_archive::{ArchiveError, fetch_archived_logs, fetch_archived_logs_for_run, fetch_archived_meta};
 use crate::handlers::run_discovery::{discover_live_run, refresh_step_status, refresh_task, DiscoverError};
 use crate::handlers::step_log_stream::{stream_step_logs, wait_for_container_ready, WaitResult};
 use crate::models::run_stream::{
@@ -504,7 +504,10 @@ async fn wait_for_pipelinerun_terminal_status(run_name: &str) -> (RunStatus, Opt
 /// step-by-step presentation order the live path streams in, so the FE
 /// doesn't need two different rendering paths for live vs. archived.
 async fn stream_archived_logs(run_name: &str) -> Vec<LogLine> {
-    match fetch_archived_logs(run_name).await {
+    // Use fetch_archived_logs_for_run instead of fetch_archived_logs
+    // so Loki's task-ref-based `task` label is remapped to the
+    // pipeline task name that the `meta` event uses.
+    match fetch_archived_logs_for_run(run_name).await {
         Ok(mut lines) => {
             lines.sort_by(|a, b| {
                 (a.task.as_str(), a.step.as_str(), a.timestamp.as_deref().unwrap_or(""))

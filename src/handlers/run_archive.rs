@@ -428,3 +428,50 @@ pub async fn fetch_archived_logs(run_name: &str) -> Result<Vec<LogLine>, Archive
 
     Ok(lines)
 }
+
+
+// run_archive.rs
+
+/// Same as `fetch_archived_logs` but remaps Loki's `task` label (which
+/// your cluster's log shipper sets from the pod's `app` or `tekton.dev/task`
+/// label — the taskRef name) back to the pipelineTaskName so it matches
+/// what the `meta` event uses.
+pub async fn fetch_archived_logs_for_run(run_name: &str) -> Result<Vec<LogLine>, ArchiveError> {
+    // Fetch the PG records to build the taskRef -> pipelineTaskName mapping.
+    let (_, tr_data_list) = fetch_pg_records(run_name).await?;
+
+    // Build: task_ref_name -> pipeline_task_name
+    let task_ref_to_pipeline_task: std::collections::HashMap<String, String> = tr_data_list
+        .iter()
+        .filter_map(|tr| {
+            let pipeline_task_name = tr
+                .get("metadata")
+                .and_then(|m| m.get("labels"))
+                .and_then(|l| l.get("tekton.dev/pipelineTask"))
+                .and_then(|n| n.as_str())
+                .map(String::from)?;
+
+            // The task ref name is what Loki's `task` label will contain.
+            let task_ref_name = tr
+                .get("spec")
+                .and_then(|s| s.get("taskRef"))
+                .and_then(|r| r.get("name"))
+                .and_then(|n| n.as_str())
+                .map(String::from)?;
+
+            Some((task_ref_name, pipeline_task_name))
+        })
+        .collect();
+
+    let mut lines = fetch_archived_logs(run_name).await?;
+
+    // Remap task names in place.
+    for line in &mut lines {
+        if let Some(mapped) = task_ref_to_pipeline_task.get(&line.task) {
+            line.task = mapped.clone();
+        }
+        // If no mapping found, leave as-is — better than dropping the line.
+    }
+
+    Ok(lines)
+}
