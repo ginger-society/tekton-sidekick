@@ -10,19 +10,48 @@
 //! them, then reads each TaskRun's own `status.steps[]` for step-level
 //! status. This works for any pipeline, and for runs that are mid-flight,
 //! finished, or only partially started.
+//!
+//! ## CustomRun / RemoteTask proxy TaskRuns
+//!
+//! When a Pipeline task uses `taskRef: apiVersion: gingersociety.org/v1alpha1,
+//! kind: RemoteTask`, Tekton creates a **CustomRun** (not a TaskRun) for that
+//! step and records it in `PipelineRun.status.childReferences` with
+//! `kind: CustomRun`. The remote-task-controller then creates a *proxy*
+//! TaskRun named `<customrun-name>-exec` and labelled
+//! `remotetask-customrun=<customrun-name>`.
+//!
+//! Without special handling, discovery would call `get_taskrun(customrun_name)`
+//! which 404s (because the child is a CustomRun, not a TaskRun), and the step
+//! would sit permanently Pending.
+//!
+//! The fix: `child_refs()` now also returns the `kind` field from each
+//! childReference. For `kind: CustomRun` children we call
+//! `resolve_customrun_taskrun()` to find the proxy TaskRun by its
+//! `remotetask-customrun=<customrun-name>` label, then treat it exactly like
+//! any other TaskRun from that point on.
 
 use serde_json::Value;
 
 use crate::db::k8s_tekton::{
-    condition_reason, condition_status, get_pipelinerun, get_taskrun, json_get, json_str,
+    condition_reason, condition_status, get_pipelinerun, get_taskrun,
+    list_taskruns_by_label, json_get, json_str,
 };
 use crate::models::run_stream::{RunMeta, RunSource, RunStatus, StepMeta, TaskMeta};
+
+// Label key used by the remote-task-controller (no slash — see customrun.rs).
+const CUSTOMRUN_LABEL: &str = "remotetask-customrun";
+
+// ── childReferences parsing ───────────────────────────────────────────────────
 
 /// One child reference Tekton attaches to PipelineRun.status as the run
 /// progresses — `{pipelineTaskName, name, kind, ...}`.
 struct ChildRef {
     pipeline_task_name: String,
-    taskrun_name: String,
+    /// The name of the child object (TaskRun name for `kind: TaskRun`;
+    /// CustomRun name for `kind: CustomRun`).
+    child_name: String,
+    /// "TaskRun" or "CustomRun" (or anything else Tekton may emit).
+    kind: String,
 }
 
 fn child_refs(pr_status: &Value) -> Vec<ChildRef> {
@@ -33,10 +62,16 @@ fn child_refs(pr_status: &Value) -> Vec<ChildRef> {
             arr.iter()
                 .filter_map(|c| {
                     let pipeline_task_name = c.get("pipelineTaskName")?.as_str()?.to_string();
-                    let taskrun_name = c.get("name")?.as_str()?.to_string();
+                    let child_name = c.get("name")?.as_str()?.to_string();
+                    let kind = c
+                        .get("kind")
+                        .and_then(|k| k.as_str())
+                        .unwrap_or("TaskRun")
+                        .to_string();
                     Some(ChildRef {
                         pipeline_task_name,
-                        taskrun_name,
+                        child_name,
+                        kind,
                     })
                 })
                 .collect()
@@ -57,7 +92,8 @@ fn legacy_task_runs(pr_status: &Value) -> Vec<ChildRef> {
                         v.get("pipelineTaskName")?.as_str()?.to_string();
                     Some(ChildRef {
                         pipeline_task_name,
-                        taskrun_name: taskrun_name.clone(),
+                        child_name: taskrun_name.clone(),
+                        kind: "TaskRun".to_string(), // legacy map only contains TaskRuns
                     })
                 })
                 .collect()
@@ -175,6 +211,37 @@ fn pod_name_for_taskrun(tr_status: &Value, taskrun_name: &str) -> String {
         .unwrap_or_else(|| format!("{}-pod", taskrun_name))
 }
 
+// ── CustomRun proxy TaskRun resolution ────────────────────────────────────────
+
+/// For a `kind: CustomRun` childReference, find the proxy TaskRun that the
+/// remote-task-controller created for it.
+///
+/// The controller names it `<customrun-name>-exec` and labels it
+/// `remotetask-customrun=<customrun-name>`. We first try the deterministic
+/// name (one API call, no label scan), then fall back to the label selector
+/// in case the naming convention ever changes or the TaskRun was created with
+/// a different name.
+///
+/// Returns `None` if the proxy TaskRun doesn't exist yet (CustomRun is queued
+/// but the controller hasn't acted yet) — callers treat this as Pending.
+async fn resolve_customrun_taskrun(
+    namespace: &str,
+    customrun_name: &str,
+) -> Result<Option<kube::api::DynamicObject>, kube::Error> {
+    // Fast path: try the deterministic name first.
+    let exec_name = format!("{customrun_name}-exec");
+    if let Some(tr) = get_taskrun(namespace, &exec_name).await? {
+        return Ok(Some(tr));
+    }
+
+    // Fallback: scan by label (handles any naming deviation).
+    let selector = format!("{CUSTOMRUN_LABEL}={customrun_name}");
+    let items = list_taskruns_by_label(namespace, &selector).await?;
+    Ok(items.into_iter().next())
+}
+
+// ── Errors ────────────────────────────────────────────────────────────────────
+
 /// Errors that mean "go look in the archive instead" vs real cluster
 /// problems the caller should surface.
 pub enum DiscoverError {
@@ -187,6 +254,8 @@ impl From<kube::Error> for DiscoverError {
         DiscoverError::Kube(e)
     }
 }
+
+// ── Main discovery ────────────────────────────────────────────────────────────
 
 /// Fetch the live PipelineRun + its child TaskRuns and assemble a full
 /// `RunMeta`. Returns `Err(DiscoverError::NotFound)` if the PipelineRun
@@ -232,10 +301,6 @@ pub async fn discover_live_run(namespace: &str, run_name: &str) -> Result<RunMet
             .and_then(|(_, t, _)| t.clone())
     };
 
-    // Separate lookup (rather than folding into task_ref_lookup's tuple)
-    // so a task that's missing from `declared` entirely (shouldn't
-    // normally happen -- see the comment above) still gets `vec![]`
-    // rather than this needing to thread an Option through every call site.
     let depends_on_lookup = |pipeline_task_name: &str| -> Vec<String> {
         declared
             .iter()
@@ -254,8 +319,7 @@ pub async fn discover_live_run(namespace: &str, run_name: &str) -> Result<RunMet
 
         let Some(cref) = matching_ref else {
             // Declared in the pipeline spec but Tekton hasn't created a
-            // TaskRun for it yet (e.g. blocked on a prior task / `when`
-            // expression) — report it as pending with no steps yet.
+            // child for it yet (blocked on prior task / `when` expression).
             tasks.push(TaskMeta {
                 name: pipeline_task_name.clone(),
                 task_ref,
@@ -269,7 +333,15 @@ pub async fn discover_live_run(namespace: &str, run_name: &str) -> Result<RunMet
             continue;
         };
 
-        match get_taskrun(namespace, &cref.taskrun_name).await {
+        // For CustomRun children we must resolve the proxy TaskRun first.
+        // For TaskRun children child_name IS the TaskRun name already.
+        let taskrun_result = if cref.kind == "CustomRun" {
+            resolve_customrun_taskrun(namespace, &cref.child_name).await
+        } else {
+            get_taskrun(namespace, &cref.child_name).await
+        };
+
+        match taskrun_result {
             Ok(Some(tr)) => {
                 let empty_tr = Value::Object(Default::default());
                 let tr_status = json_get(&tr, &["status"]).unwrap_or(&empty_tr);
@@ -278,12 +350,17 @@ pub async fn discover_live_run(namespace: &str, run_name: &str) -> Result<RunMet
                 let tr_started = tr_status.get("startTime").is_some();
                 let status = RunStatus::from_condition(tr_cond_status.as_deref(), tr_started);
                 let steps = steps_from_taskrun_status(tr_status);
-                let pod_name = pod_name_for_taskrun(tr_status, &cref.taskrun_name);
+                let actual_taskrun_name = tr
+                    .metadata
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| cref.child_name.clone());
+                let pod_name = pod_name_for_taskrun(tr_status, &actual_taskrun_name);
 
                 tasks.push(TaskMeta {
                     name: pipeline_task_name.clone(),
                     task_ref,
-                    taskrun_name: cref.taskrun_name.clone(),
+                    taskrun_name: actual_taskrun_name,
                     pod_name: Some(pod_name),
                     status,
                     reason: tr_cond_reason,
@@ -292,12 +369,14 @@ pub async fn discover_live_run(namespace: &str, run_name: &str) -> Result<RunMet
                 });
             }
             Ok(None) => {
-                // TaskRun was referenced but is gone (race / already
-                // garbage-collected) — still pending from our perspective.
+                // TaskRun (or proxy TaskRun for CustomRun) not created yet
+                // or already GC'd — still pending from our perspective.
                 tasks.push(TaskMeta {
                     name: pipeline_task_name.clone(),
                     task_ref,
-                    taskrun_name: cref.taskrun_name.clone(),
+                    // For CustomRun, use child_name (the CustomRun name) as a
+                    // placeholder so refresh_task can find it later.
+                    taskrun_name: cref.child_name.clone(),
                     pod_name: None,
                     status: RunStatus::Pending,
                     reason: None,
@@ -345,22 +424,21 @@ pub async fn refresh_step_status(
     steps.into_iter().find(|s| s.name == step_name)
 }
 
-/// Re-fetch a single pipeline task by name, for a task that didn't have a
-/// TaskRun yet at the moment `discover_live_run` first ran.
+/// Re-fetch a single pipeline task by name, handling both normal TaskRun
+/// children and CustomRun children (where the real work happens in a proxy
+/// TaskRun created by the remote-task-controller).
 ///
 /// This is the fix for tasks blocked behind an earlier task at the time a
-/// client connects (e.g. `test` and `summarize` waiting on `fetch`): the
-/// initial `RunMeta` snapshot correctly reports them as `taskrun_name: ""`,
-/// `steps: []` — accurate at that instant — but if the caller treats that
-/// as permanent and never looks again, it ends up silently skipping the
-/// task forever once its TaskRun *does* appear, even though the task goes
-/// on to run and finish normally.
+/// client connects: the initial `RunMeta` snapshot correctly reports them as
+/// `taskrun_name: ""`, `steps: []` — accurate at that instant — but if the
+/// caller treats that as permanent and never looks again, it ends up silently
+/// skipping the task forever once its TaskRun *does* appear.
 ///
-/// Looks up the PipelineRun fresh, finds the (now-existing) child
-/// reference for `pipeline_task_name`, and rebuilds a `TaskMeta` for it the
-/// same way `discover_live_run` does for tasks that already had one.
-/// Returns `None` if the TaskRun still doesn't exist yet (caller should
-/// keep polling) or the PipelineRun itself is gone.
+/// Looks up the PipelineRun fresh, finds the (now-existing) child reference
+/// for `pipeline_task_name`, resolves the actual TaskRun (via proxy lookup
+/// for CustomRun children), and rebuilds a `TaskMeta` for it. Returns `None`
+/// if the TaskRun still doesn't exist yet (caller should keep polling) or the
+/// PipelineRun itself is gone.
 pub async fn refresh_task(
     namespace: &str,
     run_name: &str,
@@ -394,7 +472,13 @@ pub async fn refresh_task(
         return Ok(None);
     };
 
-    match get_taskrun(namespace, &cref.taskrun_name).await? {
+    let taskrun_result = if cref.kind == "CustomRun" {
+        resolve_customrun_taskrun(namespace, &cref.child_name).await
+    } else {
+        get_taskrun(namespace, &cref.child_name).await
+    };
+
+    match taskrun_result? {
         Some(tr) => {
             let empty_tr = Value::Object(Default::default());
             let tr_status = json_get(&tr, &["status"]).unwrap_or(&empty_tr);
@@ -403,12 +487,17 @@ pub async fn refresh_task(
             let tr_started = tr_status.get("startTime").is_some();
             let status = RunStatus::from_condition(tr_cond_status.as_deref(), tr_started);
             let steps = steps_from_taskrun_status(tr_status);
-            let pod_name = pod_name_for_taskrun(tr_status, &cref.taskrun_name);
+            let actual_taskrun_name = tr
+                .metadata
+                .name
+                .clone()
+                .unwrap_or_else(|| cref.child_name.clone());
+            let pod_name = pod_name_for_taskrun(tr_status, &actual_taskrun_name);
 
             Ok(Some(TaskMeta {
                 name: pipeline_task_name.to_string(),
                 task_ref,
-                taskrun_name: cref.taskrun_name.clone(),
+                taskrun_name: actual_taskrun_name,
                 pod_name: Some(pod_name),
                 status,
                 reason: tr_cond_reason,

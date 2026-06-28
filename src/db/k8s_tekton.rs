@@ -130,6 +130,37 @@ pub async fn get_task(namespace: &str, name: &str) -> Result<Option<DynamicObjec
     Ok(None)
 }
 
+/// List TaskRuns matching a label selector string, e.g.
+/// `"remotetask-customrun=my-customrun-name"`.
+///
+/// Used by `run_discovery` to resolve the proxy TaskRun created by the
+/// remote-task-controller for a `kind: CustomRun` child reference.
+///
+/// Returns an empty Vec (not an error) on 404 or if no items match.
+/// A safety cap of 10 is used here — there should be exactly one proxy
+/// TaskRun per CustomRun, so anything higher is a bug in the controller,
+/// not a legitimate case.
+pub async fn list_taskruns_by_label(
+    namespace: &str,
+    label_selector: &str,
+) -> Result<Vec<DynamicObject>, kube::Error> {
+    let lp = ListParams::default().labels(label_selector).limit(10);
+
+    for attempt in 0..2u8 {
+        let client = get_client().await;
+        let api: Api<DynamicObject> =
+            Api::namespaced_with(client, namespace, &taskrun_resource());
+        match api.list(&lp).await {
+            Ok(list) => return Ok(list.items),
+            Err(ref e) if is_unauthorized(e) && attempt == 0 => {
+                handle_unauthorized().await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Vec::new())
+}
+
 // ── small JSON-pointer style helpers over DynamicObject.data ─────────────
 
 pub fn json_get<'a>(obj: &'a DynamicObject, path: &[&str]) -> Option<&'a Value> {
