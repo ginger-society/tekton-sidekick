@@ -79,7 +79,18 @@ impl OpenApiResponderInner for ApiError {
     }
 }
 
-/// GET /<namespace>/runs-by-label?labels=k1=v1,k2=v2
+/// Default number of runs returned when `limit` isn't specified — covers
+/// the common case of "what happened recently" without the caller having
+/// to think about pagination.
+const DEFAULT_LIMIT: u32 = 7;
+
+/// Hard ceiling on `limit`, regardless of what the caller requests.
+/// Values above this are clamped down rather than rejected with a 400 —
+/// a generous-but-bounded response is more useful to a caller than an
+/// error over what's ultimately just a result-count preference.
+const MAX_LIMIT: u32 = 50;
+
+/// GET /<namespace>/runs-by-label?labels=k1=v1,k2=v2&limit=7
 ///
 /// `labels` takes one or more comma-separated `key=value` pairs, ANDed
 /// together (a run must match every pair to be returned) — same
@@ -87,16 +98,23 @@ impl OpenApiResponderInner for ApiError {
 /// `ginger-gitter/branch=main`); since this is a query param rather than
 /// a path segment, no escaping is needed for that.
 ///
+/// `limit` caps the number of runs returned, most-recent-first. Optional,
+/// defaults to 7; values above 50 are clamped down to 50 rather than
+/// rejected. Applied independently to the live and archived sources
+/// before merging (see handlers::runs_by_label for why), so the returned
+/// count can occasionally land a little under `limit` after dedup.
+///
 /// Queries live PipelineRuns (k8s API) and archived ones (tekton-results
 /// Postgres) concurrently, merges, and dedupes by name (live wins on
 /// conflict). Returns a lightweight `RunSummary` per match — name +
 /// created_time only, no task/step detail — since this is meant as a
 /// fast discovery/listing call, not a full run-detail fetch.
 #[openapi(tag = "runs")]
-#[get("/<namespace>/runs-by-label?<labels>")]
+#[get("/<namespace>/runs-by-label?<labels>&<limit>")]
 pub async fn runs_by_label(
     namespace: String,
     labels: String,
+    limit: Option<u32>,
     pg_pool: &State<Pool>,
 ) -> Result<Json<Vec<RunSummary>>, ApiError> {
     let pairs = parse_label_selector(&labels).map_err(|e| ApiError::bad_request(e.to_string()))?;
@@ -107,7 +125,16 @@ pub async fn runs_by_label(
         ));
     }
 
-    match fetch_runs_by_label(pg_pool.inner(), &namespace, &pairs).await {
+    // 0 would mean "always return nothing", which is never useful as a
+    // default and almost certainly a caller mistake (e.g. an empty/unset
+    // form field landing here as 0) — fall back to DEFAULT_LIMIT rather
+    // than silently returning an empty list for that case.
+    let limit = match limit {
+        None | Some(0) => DEFAULT_LIMIT,
+        Some(n) => n.min(MAX_LIMIT),
+    };
+
+    match fetch_runs_by_label(pg_pool.inner(), &namespace, &pairs, limit).await {
         Ok(runs) => Ok(Json(runs)),
         Err(RunsByLabelError::Kube(e)) => Err(ApiError::bad_gateway(format!(
             "error reading PipelineRuns from cluster: {e}"

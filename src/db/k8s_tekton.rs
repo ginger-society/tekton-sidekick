@@ -18,6 +18,7 @@ use super::k8s_client::{get_client, handle_unauthorized, is_unauthorized};
 
 pub const TEKTON_GROUP: &str = "tekton.dev";
 pub const TEKTON_VERSION: &str = "v1";
+const LIST_SAFETY_CAP: u32 = 200;
 
 // We use `from_gvk_with_plural` (not `from_gvk`) deliberately: `from_gvk`
 // *guesses* the plural from the kind name, and while PipelineRun/TaskRun
@@ -167,7 +168,9 @@ pub async fn list_pipelineruns(
     namespace: &str,
     label_selector: &str,
 ) -> Result<Vec<DynamicObject>, kube::Error> {
-    let lp = ListParams::default().labels(label_selector);
+    let lp = ListParams::default()
+        .labels(label_selector)
+        .limit(LIST_SAFETY_CAP);
  
     for attempt in 0..2u8 {
         let client = get_client().await;

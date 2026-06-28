@@ -1,6 +1,6 @@
 // src/handlers/runs_by_label.rs
 //
-// Backing handler for GET /<namespace>/runs-by-label?labels=k1=v1,k2=v2
+// Backing handler for GET /<namespace>/runs-by-label?labels=k1=v1,k2=v2&limit=7
 //
 // Two sources, queried concurrently:
 //   - live PipelineRuns straight from the k8s API (covers runs tekton-results
@@ -11,6 +11,16 @@
 // Merged and deduped by name, preferring the live copy when a run exists
 // in both — same "live wins" precedent as run_event_stream.rs, which
 // always tries discover_live_run before falling back to the archive.
+//
+// `limit` is applied independently to each source BEFORE merging (not
+// fetch-all-then-truncate): the archive query gets a real SQL `LIMIT`,
+// and the live side is sorted by created_time desc and truncated
+// client-side (k8s `list()` doesn't guarantee recency ordering, so its
+// own `.limit()` can't be used for this — see the comment in
+// db::k8s_tekton::list_pipelineruns). This is the faster of the two
+// possible designs; the tradeoff, as discussed, is that the final merged
+// count can end up slightly under `limit` after dedup if the same run
+// appears in both the live and archive top-N slices.
 
 use deadpool_postgres::Pool;
 
@@ -45,11 +55,12 @@ impl From<kube::Error> for RunsByLabelError {
 async fn live_summaries(
     namespace: &str,
     pairs: &[(String, String)],
+    limit: u32,
 ) -> Result<Vec<RunSummary>, RunsByLabelError> {
     let selector = to_k8s_selector(pairs);
     let runs = list_pipelineruns(namespace, &selector).await?;
 
-    Ok(runs
+    let mut summaries: Vec<RunSummary> = runs
         .into_iter()
         .filter_map(|obj| {
             let name = obj.metadata.name.clone()?;
@@ -67,7 +78,16 @@ async fn live_summaries(
                 source: RunSource::Tekton,
             })
         })
-        .collect())
+        .collect();
+
+    // k8s list() order isn't recency-guaranteed (see the comment on
+    // list_pipelineruns's safety cap) — sort newest-first ourselves
+    // before truncating, so `limit` actually means "most recent N", not
+    // "whatever N the API server happened to return first".
+    summaries.sort_by(|a, b| b.created_time.cmp(&a.created_time));
+    summaries.truncate(limit as usize);
+
+    Ok(summaries)
 }
 
 // ── Archive (Postgres) ─────────────────────────────────────────────────────
@@ -79,10 +99,16 @@ async fn live_summaries(
 /// is repeated in the query string (last one simply also gets ANDed in,
 /// rather than silently overwriting an earlier value the way building one
 /// merged JSON object would).
+///
+/// Unlike the live side, `LIMIT $N` here is a real, order-respecting SQL
+/// limit — `ORDER BY created_time DESC LIMIT $N` is applied by Postgres
+/// itself before rows are even returned, so no client-side re-sort is
+/// needed for this half.
 async fn archived_summaries(
     pool: &Pool,
     namespace: &str,
     pairs: &[(String, String)],
+    limit: u32,
 ) -> Result<Vec<RunSummary>, RunsByLabelError> {
     let client = pool
         .get()
@@ -95,12 +121,10 @@ async fn archived_summaries(
     // Two bugs were fixed here versus earlier drafts of this function:
     //
     // 1. Key bug: `serde_json::json!({ k: v })` does NOT interpolate the
-    //    variable `k` into the key position — `json!`'s key syntax only
-    //    supports a literal identifier or string there, so that line was
-    //    silently building the JSON object {"k": "<value>"} every time,
-    //    with the literal key name "k", regardless of what label key was
-    //    actually requested. The containment check then never matched any
-    //    real label. Fixed by building a `serde_json::Map` explicitly so
+    //    variable `k` into the key position — that line was silently
+    //    building the JSON object {"k": "<value>"} every time, with the
+    //    literal key name "k", regardless of what label key was actually
+    //    requested. Fixed by building a `serde_json::Map` explicitly so
     //    the real key is used.
     //
     // 2. Wire-format bug: an earlier fix serialized the JSON object to a
@@ -108,12 +132,12 @@ async fn archived_summaries(
     //    server-side. When a placeholder sits directly inside a `::jsonb`
     //    cast, Postgres can infer that placeholder's *native* type as
     //    jsonb, but tokio-postgres was sending the `String` value in
-    //    `text` wire format — a real mismatch, which surfaced at runtime
-    //    as "error serializing parameter N". Fixed by binding
-    //    `serde_json::Value` directly (no pre-stringify, no `::jsonb`
-    //    cast needed) — tokio-postgres's `with-serde_json-1` feature
-    //    (already enabled per db/pg.rs) gives `Value` a native `ToSql`
-    //    impl that targets Postgres's json/jsonb wire format correctly.
+    //    `text` wire format — surfaced at runtime as "error serializing
+    //    parameter N". Fixed by binding `serde_json::Value` directly (no
+    //    pre-stringify, no `::jsonb` cast needed) — tokio-postgres's
+    //    `with-serde_json-1` feature (already enabled per db/pg.rs) gives
+    //    `Value` a native `ToSql` impl that targets Postgres's json/jsonb
+    //    wire format correctly.
     let mut clauses = String::new();
     let mut json_params: Vec<serde_json::Value> = Vec::with_capacity(pairs.len());
     for (i, (k, v)) in pairs.iter().enumerate() {
@@ -125,6 +149,13 @@ async fn archived_summaries(
         json_params.push(serde_json::Value::Object(obj));
     }
 
+    // `limit` is the next placeholder after namespace ($1) and all the
+    // label params ($2..$N) — bound as a typed param (cast to ::int8)
+    // rather than interpolated into the query text, consistent with
+    // every other value in this query.
+    let limit_placeholder = pairs.len() + 2;
+    let limit_i64 = limit as i64;
+
     let query = format!(
         "SELECT data->'metadata'->>'name' AS name, \
                 data->'metadata'->>'creationTimestamp' AS created_time \
@@ -132,21 +163,24 @@ async fn archived_summaries(
          WHERE type = 'tekton.dev/v1.PipelineRun' \
            AND data->'metadata'->>'namespace' = $1::text \
            {clauses} \
-         ORDER BY created_time DESC"
+         ORDER BY created_time DESC \
+         LIMIT ${limit_placeholder}::int8"
     );
 
     // tokio-postgres needs a homogeneous param slice of trait objects.
     // `namespace` is bound as an owned `String` (`&str` would become
     // `&&str` here and fail to coerce into `&dyn ToSql`); `json_params`
     // entries are owned `serde_json::Value`s, bound by reference the
-    // same way.
+    // same way; `limit_i64` likewise needs to outlive the call as an
+    // owned binding.
     let namespace_owned = namespace.to_string();
     let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-        Vec::with_capacity(1 + json_params.len());
+        Vec::with_capacity(2 + json_params.len());
     params.push(&namespace_owned);
     for p in &json_params {
         params.push(p);
     }
+    params.push(&limit_i64);
 
     let rows = client
         .query(query.as_str(), &params)
@@ -173,11 +207,16 @@ pub async fn fetch_runs_by_label(
     pool: &Pool,
     namespace: &str,
     pairs: &[(String, String)],
+    limit: u32,
 ) -> Result<Vec<RunSummary>, RunsByLabelError> {
     // Run both sources concurrently — independent calls, no shared state.
+    // Each gets the same `limit` applied independently (see module-level
+    // doc comment for why: cheaper than fetch-all-then-truncate, at the
+    // cost of the final merged count possibly landing a bit under `limit`
+    // after dedup).
     let (live_res, archived_res) = tokio::join!(
-        live_summaries(namespace, pairs),
-        archived_summaries(pool, namespace, pairs),
+        live_summaries(namespace, pairs, limit),
+        archived_summaries(pool, namespace, pairs, limit),
     );
 
     let live = live_res?;
@@ -210,5 +249,14 @@ pub async fn fetch_runs_by_label(
     }
 
     merged.sort_by(|a, b| b.created_time.cmp(&a.created_time));
+
+    // Final safety truncate: each source was already capped at `limit`
+    // independently, so this merged list is at most 2*limit before dedup
+    // — dedup usually brings it back near `limit`, but a final truncate
+    // here guarantees the response never exceeds what the caller asked
+    // for, even in the rare case both sources contributed close to
+    // `limit` distinct entries each.
+    merged.truncate(limit as usize);
+
     Ok(merged)
 }
