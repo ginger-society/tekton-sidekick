@@ -19,10 +19,10 @@ stage = ""
 stage_k8 = ""
 
 [urls]
-prod = "https://api.gingersociety.org/presence"
-stage_k8 = "http://ginger-presence-service/presence"
-stage = "https://api.gingersociety.org/presence"
-prod_k8 = "https://api.gingersociety.org/presence"
-dev = "https://api.gingersociety.org/presence"
+prod = "https://tekton.gingersociety.org/sidekick"
+stage_k8 = "http://tekton-sidekick-service/presence"
+stage = "https://tekton.gingersociety.org/sidekick"
+prod_k8 = "https://tekton.gingersociety.org/sidekick"
+dev = "https://tekton.gingersociety.org/sidekick"
 
 [urls_ws]
