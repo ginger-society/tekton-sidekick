@@ -99,7 +99,21 @@ async fn archived_summaries(
         clauses.push_str(&format!(
             " AND data->'metadata'->'labels' @> ${placeholder}::jsonb"
         ));
-        json_params.push(serde_json::json!({ k: v }).to_string());
+        // BUG (fixed): `serde_json::json!({ k: v })` does NOT interpolate
+        // the variable `k` into the key position — `json!`'s key syntax
+        // only supports a literal identifier or string there, so this
+        // was silently building the JSON object {"k": "<value>"} every
+        // time, with the literal key name "k", regardless of what label
+        // key was actually requested. That meant the containment check
+        // never matched any real label and the archive half of this
+        // query always returned zero rows. `json!` *does* support
+        // interpolating a variable into the key position if you wrap it
+        // in parens: `json!({ (k.clone()): v })` — but building a
+        // one-entry serde_json::Map explicitly is clearer here than
+        // relying on that less-obvious macro syntax.
+        let mut obj = serde_json::Map::new();
+        obj.insert(k.clone(), serde_json::Value::String(v.clone()));
+        json_params.push(serde_json::Value::Object(obj).to_string());
     }
 
     let query = format!(
