@@ -3,6 +3,7 @@ use rocket::serde::json::Json;
 use rocket::State;
 use rocket_okapi::openapi;
 pub mod run_stream;
+pub mod runs_by_label;
 
 #[openapi()]
 #[get("/")]

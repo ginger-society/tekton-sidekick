@@ -10,7 +10,7 @@
 //! Follows the same `get_client()` / `is_unauthorized()` / `handle_unauthorized()`
 //! retry shape used elsewhere in this codebase (see k8s.rs, k8s_exec.rs).
 
-use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
+use kube::api::{ApiResource, DynamicObject, GroupVersionKind, ListParams};
 use kube::Api;
 use serde_json::Value;
 
@@ -161,4 +161,25 @@ pub fn condition_reason(obj: &DynamicObject) -> Option<String> {
         .get("reason")?
         .as_str()
         .map(|s| s.to_string())
+}
+
+pub async fn list_pipelineruns(
+    namespace: &str,
+    label_selector: &str,
+) -> Result<Vec<DynamicObject>, kube::Error> {
+    let lp = ListParams::default().labels(label_selector);
+ 
+    for attempt in 0..2u8 {
+        let client = get_client().await;
+        let api: Api<DynamicObject> =
+            Api::namespaced_with(client, namespace, &pipelinerun_resource());
+        match api.list(&lp).await {
+            Ok(list) => return Ok(list.items),
+            Err(ref e) if is_unauthorized(e) && attempt == 0 => {
+                handle_unauthorized().await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Vec::new())
 }

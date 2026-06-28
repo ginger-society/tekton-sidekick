@@ -1,10 +1,12 @@
 // src/models/run_stream.rs
 
 use serde::{Deserialize, Serialize};
+use rocket_okapi::JsonSchema;
+
 
 /// Where the data for this run is coming from. The FE can use this to decide
 /// whether to show a "live" indicator or an "archived" badge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RunSource {
     /// Read live from the Tekton/Kubernetes API.
