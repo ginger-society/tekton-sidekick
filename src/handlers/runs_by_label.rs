@@ -56,10 +56,10 @@ async fn live_summaries(
             // k8s_openapi's `Time` wraps `jiff::Timestamp` in this version
             // (it used to wrap `chrono::DateTime`, which is where
             // `.to_rfc3339()` would have come from). `jiff::Timestamp`
-            // doesn't have that method — but it doesn't need to: its
+            // has no `to_rfc3339` method — but it doesn't need one: its
             // `Display`/`to_string()` impl already produces RFC3339
             // output directly (e.g. "2024-07-10T21:19:25.567Z"), so
-            // `.to_string()` is the correct replacement, not a shim.
+            // `.to_string()` is the correct replacement here.
             let created_time = obj.metadata.creation_timestamp.as_ref()?.0.to_string();
             Some(RunSummary {
                 name,
@@ -89,31 +89,40 @@ async fn archived_summaries(
         .await
         .map_err(|e| RunsByLabelError::Db(e.to_string()))?;
 
-    // Build "AND data->'metadata'->'labels' @> $2::jsonb AND ... @> $3::jsonb"
-    // dynamically, binding each pair as its own single-key JSON object
-    // parameter rather than interpolating label text into the SQL string.
+    // Build "AND data->'metadata'->'labels' @> $2 AND ... @> $3" dynamically,
+    // binding each pair as its own single-key JSON object parameter.
+    //
+    // Two bugs were fixed here versus earlier drafts of this function:
+    //
+    // 1. Key bug: `serde_json::json!({ k: v })` does NOT interpolate the
+    //    variable `k` into the key position — `json!`'s key syntax only
+    //    supports a literal identifier or string there, so that line was
+    //    silently building the JSON object {"k": "<value>"} every time,
+    //    with the literal key name "k", regardless of what label key was
+    //    actually requested. The containment check then never matched any
+    //    real label. Fixed by building a `serde_json::Map` explicitly so
+    //    the real key is used.
+    //
+    // 2. Wire-format bug: an earlier fix serialized the JSON object to a
+    //    `String` and relied on `${placeholder}::jsonb` to cast it
+    //    server-side. When a placeholder sits directly inside a `::jsonb`
+    //    cast, Postgres can infer that placeholder's *native* type as
+    //    jsonb, but tokio-postgres was sending the `String` value in
+    //    `text` wire format — a real mismatch, which surfaced at runtime
+    //    as "error serializing parameter N". Fixed by binding
+    //    `serde_json::Value` directly (no pre-stringify, no `::jsonb`
+    //    cast needed) — tokio-postgres's `with-serde_json-1` feature
+    //    (already enabled per db/pg.rs) gives `Value` a native `ToSql`
+    //    impl that targets Postgres's json/jsonb wire format correctly.
     let mut clauses = String::new();
-    let mut json_params: Vec<String> = Vec::with_capacity(pairs.len());
+    let mut json_params: Vec<serde_json::Value> = Vec::with_capacity(pairs.len());
     for (i, (k, v)) in pairs.iter().enumerate() {
         let placeholder = i + 2; // $1 is namespace
-        clauses.push_str(&format!(
-            " AND data->'metadata'->'labels' @> ${placeholder}::jsonb"
-        ));
-        // BUG (fixed): `serde_json::json!({ k: v })` does NOT interpolate
-        // the variable `k` into the key position — `json!`'s key syntax
-        // only supports a literal identifier or string there, so this
-        // was silently building the JSON object {"k": "<value>"} every
-        // time, with the literal key name "k", regardless of what label
-        // key was actually requested. That meant the containment check
-        // never matched any real label and the archive half of this
-        // query always returned zero rows. `json!` *does* support
-        // interpolating a variable into the key position if you wrap it
-        // in parens: `json!({ (k.clone()): v })` — but building a
-        // one-entry serde_json::Map explicitly is clearer here than
-        // relying on that less-obvious macro syntax.
+        clauses.push_str(&format!(" AND data->'metadata'->'labels' @> ${placeholder}"));
+
         let mut obj = serde_json::Map::new();
         obj.insert(k.clone(), serde_json::Value::String(v.clone()));
-        json_params.push(serde_json::Value::Object(obj).to_string());
+        json_params.push(serde_json::Value::Object(obj));
     }
 
     let query = format!(
@@ -121,15 +130,16 @@ async fn archived_summaries(
                 data->'metadata'->>'creationTimestamp' AS created_time \
          FROM records \
          WHERE type = 'tekton.dev/v1.PipelineRun' \
-           AND data->'metadata'->>'namespace' = $1 \
+           AND data->'metadata'->>'namespace' = $1::text \
            {clauses} \
          ORDER BY created_time DESC"
     );
 
     // tokio-postgres needs a homogeneous param slice of trait objects.
-    // `namespace` is already `&str` (implements ToSql directly — no extra
-    // `&` needed, that would make it `&&str` and fail to coerce);
-    // `json_params` entries are owned `String`s, so we pass `&String`.
+    // `namespace` is bound as an owned `String` (`&str` would become
+    // `&&str` here and fail to coerce into `&dyn ToSql`); `json_params`
+    // entries are owned `serde_json::Value`s, bound by reference the
+    // same way.
     let namespace_owned = namespace.to_string();
     let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
         Vec::with_capacity(1 + json_params.len());
