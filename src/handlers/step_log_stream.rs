@@ -26,12 +26,13 @@ pub enum WaitResult {
     /// Pod or container never showed up in time — caller should report
     /// this as a step-level problem but keep going (mirrors the bash
     /// script's `[timeout]` yellow warning, not a hard pipeline failure).
+    AlreadyTerminated,
     TimedOut,
 }
 
 /// Block until `pod_name`'s `container` is running or terminated (i.e.
 /// logs are guaranteed to be readable), or until we give up.
-pub async fn wait_for_container_ready(namespace: &str,pod_name: &str, container: &str) -> WaitResult {
+pub async fn wait_for_container_ready(namespace: &str, pod_name: &str, container: &str) -> WaitResult {
     let mut attempt = 0u32;
 
     loop {
@@ -47,21 +48,21 @@ pub async fn wait_for_container_ready(namespace: &str,pod_name: &str, container:
                     .and_then(|statuses| statuses.iter().find(|c| c.name == container))
                     .and_then(|c| c.state.as_ref());
 
-                let is_waiting = state.map(|s| s.waiting.is_some()).unwrap_or(true);
-                let is_ready = state.is_some() && !is_waiting;
-
-                if is_ready {
-                    return WaitResult::Ready;
+                if let Some(s) = state {
+                    if s.terminated.is_some() {
+                        return WaitResult::AlreadyTerminated;
+                    }
+                    if s.running.is_some() {
+                        return WaitResult::Ready;
+                    }
+                    // still `waiting` — fall through and keep polling
                 }
             }
             Err(ref e) if is_unauthorized(e) => {
                 handle_unauthorized().await;
-                continue; // don't burn a retry on an auth refresh
+                continue;
             }
-            Err(_) => {
-                // Pod doesn't exist yet — keep waiting, same as the bash
-                // script's "Pod never appeared" branch until max_retries.
-            }
+            Err(_) => {}
         }
 
         attempt += 1;
@@ -81,13 +82,14 @@ pub async fn stream_step_logs(
     namespace: &str,
     pod_name: &str,
     container: &str,
+    already_terminated: bool,
     line_tx: tokio::sync::mpsc::UnboundedSender<(Option<String>, String)>,
 ) {
     let client = get_client().await;
     let api: Api<Pod> = Api::namespaced(client, namespace);
 
     let params = LogParams {
-        follow: true,
+        follow: !already_terminated,
         timestamps: true,
         container: Some(container.to_string()),
         ..Default::default()

@@ -255,14 +255,25 @@ async fn run_task_worker(
         .clone()
         .unwrap_or_else(|| format!("{}-pod", task.taskrun_name));
 
-    for step in &task.steps {
+        for step in &task.steps {
+        // Track whether this step's container was already finished before we
+        // ever looked at it (either the snapshot already showed it terminal,
+        // or wait_for_container_ready found it terminal on first check) — in
+        // either case we must NOT open a `follow` stream against it.
+        let mut already_terminated = !matches!(step.status, RunStatus::Pending);
+
         if matches!(step.status, RunStatus::Pending) {
             let ready = select! {
                 r = wait_for_container_ready(&namespace, &pod_name, &step.container) => Some(r),
                 _ = &mut shutdown => None,
             };
             match ready {
-                Some(WaitResult::Ready) => {}
+                Some(WaitResult::Ready) => {
+                    already_terminated = false;
+                }
+                Some(WaitResult::AlreadyTerminated) => {
+                    already_terminated = true;
+                }
                 Some(WaitResult::TimedOut) => {
                     let _ = tx.send(SseItem::Error(StreamError {
                         message: format!(
@@ -284,7 +295,13 @@ async fn run_task_worker(
         let container_cloned = step.container.clone();
         let namespace_cloned = namespace.clone();
         rocket::tokio::spawn(async move {
-            stream_step_logs(&namespace_cloned, &pod_name_cloned, &container_cloned, log_tx).await;
+            stream_step_logs(
+                &namespace_cloned,
+                &pod_name_cloned,
+                &container_cloned,
+                already_terminated,
+                log_tx,
+            ).await;
         });
 
         loop {
