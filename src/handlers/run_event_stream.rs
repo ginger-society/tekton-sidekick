@@ -362,10 +362,18 @@ async fn poll_for_task_start(
     run_name: &str,
     pipeline_task_name: &str,
 ) -> Option<TaskMeta> {
-    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+    // Safety cap only — real long-running RemoteTask builds (macOS, arm64
+    // docker, etc.) can legitimately keep a downstream task's runAfter
+    // deps unsatisfied for a long time. We don't want to declare "never
+    // started" just because deps are still legitimately running.
+    const SAFETY_CAP: std::time::Duration = std::time::Duration::from_secs(60 * 60 * 4); // 4h
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+    // Only re-check the PipelineRun's own terminal status this often —
+    // no need to hit the API every 2s for this.
+    const PR_CHECK_EVERY: u32 = 15; // ~30s at 2s poll interval
 
     let start = std::time::Instant::now();
+    let mut i: u32 = 0;
     loop {
         match refresh_task(namespace, run_name, pipeline_task_name).await {
             Ok(Some(task)) => {
@@ -376,9 +384,22 @@ async fn poll_for_task_start(
             Ok(None) => {}
             Err(_) => {}
         }
-        if start.elapsed() >= TIMEOUT {
+
+        // If the PipelineRun itself has gone terminal and this task still
+        // hasn't started, that's a genuine "never started" case — stop
+        // waiting. Otherwise keep going regardless of elapsed time.
+        if i % PR_CHECK_EVERY == 0 {
+            if let Ok(Some(pr)) = crate::db::k8s_tekton::get_pipelinerun(namespace, run_name).await {
+                if crate::db::k8s_tekton::condition_status(&pr).as_deref() != Some("Unknown") {
+                    return None;
+                }
+            }
+        }
+
+        if start.elapsed() >= SAFETY_CAP {
             return None;
         }
+        i += 1;
         rocket::tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
