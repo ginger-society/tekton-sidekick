@@ -260,7 +260,7 @@ async fn run_task_worker(
         // ever looked at it (either the snapshot already showed it terminal,
         // or wait_for_container_ready found it terminal on first check) — in
         // either case we must NOT open a `follow` stream against it.
-        let mut already_terminated = !matches!(step.status, RunStatus::Pending);
+        let mut already_terminated = step.status.is_terminal();
 
         if matches!(step.status, RunStatus::Pending) {
             let ready = select! {
