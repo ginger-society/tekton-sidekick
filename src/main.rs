@@ -48,7 +48,6 @@ async fn main() {
         .mount(
             format!("/{}/", SERVICE_PREFIX),
             routes![
-                routes::stream_counter,
                 routes::run_stream::stream_pipeline_run,
             ],
         );
